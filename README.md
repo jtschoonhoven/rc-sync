@@ -86,3 +86,56 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Automation
+
+### Mac
+
+You can run this script automatically whenever your loop station is connected like so:
+
+```
+# 1. Create a launch agent:
+cat << 'EOF' > ~/Library/LaunchAgents/com.io.github.jtschoonhoven.mountscript.plist
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.io.github.jtschoonhoven.mountscript</string>
+
+    <key>WatchPaths</key>
+    <array>
+        <!-- EDIT ME: THIS SHOULD MATCH THE NAME OF YOUR DRIVE -->
+        <string>/Volumes/BOSS_RC-202</string>
+    </array>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>cd ~ && /usr/bin/open -a Terminal -n -F -W $(realpath ~/src/rc-sync/rc-sync.sh)</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/mountscript.stdout</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/mountscript.stderr</string>
+</dict>
+</plist>
+EOF
+
+# 2. Load the service:
+launchctl load ~/Library/LaunchAgents/com.io.github.jtschoonhoven.mountscript.plist
+
+# 3. Check status
+launchctl list | grep mountscript
+
+# 4. Check logs
+tail -f /tmp/mountscript.stdout
+tail -f /tmp/mountscript.stderr
+
+# 5. To disable
+launchctl unload ~/Library/LaunchAgents/com.io.github.jtschoonhoven.mountscript.plist
+```
