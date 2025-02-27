@@ -538,7 +538,7 @@ parse_arguments() {
                 BACKUP_DIR="$2"
                 shift 2
                 ;;
-            --restore)
+            -r|--restore)
                 if [ -z "$2" ]; then
                     log_message "Error: Restore directory argument is missing" "ERROR"
                     print_usage
