@@ -23,11 +23,11 @@ log_message() {
 
     # Echo to terminal with color depending on level
     case "$level" in
-        "INFO") echo -e "${BLUE}[INFO]${NC} $message" ;;
-        "SUCCESS") echo -e "${GREEN}[SUCCESS]${NC} $message" ;;
-        "WARNING") echo -e "${YELLOW}[WARNING]${NC} $message" ;;
-        "ERROR") echo -e "${RED}[ERROR]${NC} $message" ;;
-        *) echo -e "$message" ;;
+        "INFO") printf "${BLUE}[INFO]${NC} %s\n" "$message" ;;
+        "SUCCESS") printf "${GREEN}[SUCCESS]${NC} %s\n" "$message" ;;
+        "WARNING") printf "${YELLOW}[WARNING]${NC} %s\n" "$message" ;;
+        "ERROR") printf "${RED}[ERROR]${NC} %s\n" "$message" ;;
+        *) printf "%s\n" "$message" ;;
     esac
 
     # Log to file if the backup directory exists
@@ -73,6 +73,21 @@ create_backup_dir() {
     return 0
 }
 
+# Function to get file size that works on both macOS and Linux
+get_file_size() {
+    local file="$1"
+    if stat -f %z "$file" 2>/dev/null; then
+        # macOS
+        return
+    elif stat -c %s "$file" 2>/dev/null; then
+        # Linux
+        return
+    else
+        # Fallback using ls
+        ls -l "$file" | awk '{print $5}'
+    fi
+}
+
 # Function to sync WAV files
 sync_wav_files() {
     local total_files=0
@@ -82,58 +97,201 @@ sync_wav_files() {
 
     log_message "Starting synchronization of WAV files..." "INFO"
 
-    # Get list of track directories
-    local track_dirs=$(ls -1 "$SOURCE_DIR" 2>/dev/null)
+    # Get list of track directories once and cache it
+    local track_dirs=$(ls -1 "$SOURCE_DIR" 2>/dev/null | grep -E '^[0-9]{3}_[12]$')
 
     if [ -z "$track_dirs" ]; then
         log_message "No track directories found in $SOURCE_DIR" "WARNING"
         return 1
     fi
 
-    # Process each track directory
-    for track_dir in $track_dirs; do
-        # Skip if not a directory or doesn't match expected pattern
-        if [ ! -d "$SOURCE_DIR/$track_dir" ] || ! echo "$track_dir" | grep -qE '^([0-9]{3})_[12]$'; then
-            continue
-        fi
-
-        # Extract the slot number from the directory name and remove leading zeros
-        local slot_num=$(echo "$track_dir" | sed 's/^0*\([1-9][0-9]*\)_.*/\1/')
-        # Calculate bank number (1-8 -> bank_1, 9-16 -> bank_2, etc.)
-        local bank_num=$(( (slot_num - 1) / 8 + 1 ))
+    # First pass: analyze changes per bank
+    for bank_num in 1 2 3 4 5 6 7 8; do
+        local new_count=0
+        local mod_count=0
+        local del_count=0
         local bank_dir="bank_${bank_num}"
+        local changes_detected=""
 
-        # Path to WAV file
-        local wav_file="$SOURCE_DIR/$track_dir/$track_dir.WAV"
+        # First check for deleted files in this bank
+        if [ -d "$BACKUP_DIR/$bank_dir" ]; then
+            for backup_file in $(find "$BACKUP_DIR/$bank_dir" -maxdepth 1 -name "*.WAV" 2>/dev/null); do
+                [ -f "$backup_file" ] || continue
 
-        # Skip if directory is empty or WAV file doesn't exist
-        if [ ! -f "$wav_file" ]; then
-            log_message "Skipping empty directory: $track_dir" "INFO"
+                local track_name=$(basename "$backup_file" .WAV)
+                local slot_num=${track_name%_*}  # More efficient than sed
+                slot_num=$(echo "$slot_num" | sed 's/^0*//')  # Remove leading zeros safely
+                local file_bank_num=$(( (10#$slot_num - 1) / 8 + 1 ))
+
+                [ "$file_bank_num" -ne "$bank_num" ] && continue
+
+                if [ ! -f "$SOURCE_DIR/$track_name/$track_name.WAV" ]; then
+                    del_count=$((del_count + 1))
+                    changes_detected="yes"
+                fi
+            done
+        fi
+
+        for track_dir in $track_dirs; do
+            local slot_num=${track_dir%_*}  # More efficient than sed
+            slot_num=$(echo "$slot_num" | sed 's/^0*//')  # Remove leading zeros safely
+            local current_bank_num=$(( (10#$slot_num - 1) / 8 + 1 ))  # Force base-10
+            [ "$current_bank_num" -ne "$bank_num" ] && continue
+
+            local wav_file="$SOURCE_DIR/$track_dir/$track_dir.WAV"
+            local backup_wav="$BACKUP_DIR/$bank_dir/$track_dir.WAV"
+
+            if [ -f "$wav_file" ]; then
+                if [ ! -f "$backup_wav" ]; then
+                    new_count=$((new_count + 1))
+                    changes_detected="yes"
+                else
+                    # First compare sizes (fast)
+                    local src_size=$(get_file_size "$wav_file")
+                    local dst_size=$(get_file_size "$backup_wav")
+
+                    if [ "$src_size" != "$dst_size" ] || \
+                       [ "$(head -c 65536 "$wav_file" | cksum | awk '{print $1}')" != \
+                         "$(head -c 65536 "$backup_wav" | cksum | awk '{print $1}')" ]; then
+                        mod_count=$((mod_count + 1))
+                        changes_detected="yes"
+                    fi
+                fi
+            fi
+        done
+
+        # Skip if no changes in this bank
+        [ -z "$changes_detected" ] && continue
+
+        # If there are only new files (no modifications or deletions), process without prompting
+        if [ $new_count -gt 0 ] && [ $mod_count -eq 0 ] && [ $del_count -eq 0 ]; then
+            log_message "Processing new files for bank_${bank_num}" "INFO"
+            for track_dir in $track_dirs; do
+                local slot_num=${track_dir%_*}
+                slot_num=$(echo "$slot_num" | sed 's/^0*//')
+                local current_bank_num=$(( (10#$slot_num - 1) / 8 + 1 ))
+                [ "$current_bank_num" -ne "$bank_num" ] && continue
+
+                local wav_file="$SOURCE_DIR/$track_dir/$track_dir.WAV"
+                local backup_wav="$BACKUP_DIR/$bank_dir/$track_dir.WAV"
+
+                if [ -f "$wav_file" ] && [ ! -f "$backup_wav" ]; then
+                    mkdir -p "$BACKUP_DIR/$bank_dir"
+                    log_message "Copying: $track_dir.WAV to $bank_dir" "INFO"
+                    cp "$wav_file" "$backup_wav"
+                    if [ $? -eq 0 ]; then
+                        ((copied_files++))
+                    else
+                        log_message "Failed to copy $track_dir.WAV" "ERROR"
+                        ((error_files++))
+                    fi
+                fi
+            done
             continue
         fi
 
-        # Create bank directory if it doesn't exist
-        mkdir -p "$BACKUP_DIR/$bank_dir"
+        # Show bank header before changes
+        printf "\nChanges detected in bank_%d:\n" "$bank_num"
 
-        local backup_wav="$BACKUP_DIR/$bank_dir/$track_dir.WAV"
+        # Show deleted files
+        if [ -d "$BACKUP_DIR/$bank_dir" ]; then
+            for backup_file in $(find "$BACKUP_DIR/$bank_dir" -maxdepth 1 -name "*.WAV" 2>/dev/null); do
+                [ -f "$backup_file" ] || continue
+                local track_name=$(basename "$backup_file" .WAV)
+                local slot_num=${track_name%_*}
+                slot_num=$(echo "$slot_num" | sed 's/^0*//')
+                local file_bank_num=$(( (10#$slot_num - 1) / 8 + 1 ))
+                [ "$file_bank_num" -ne "$bank_num" ] && continue
+                if [ ! -f "$SOURCE_DIR/$track_name/$track_name.WAV" ]; then
+                    printf "${RED}delete: %s${NC}\n" "$track_name.WAV"
+                fi
+            done
+        fi
 
-        ((total_files++))
+        # Show new, modified, and unchanged files
+        for track_dir in $track_dirs; do
+            local slot_num=${track_dir%_*}
+            slot_num=$(echo "$slot_num" | sed 's/^0*//')
+            local current_bank_num=$(( (10#$slot_num - 1) / 8 + 1 ))
+            [ "$current_bank_num" -ne "$bank_num" ] && continue
 
-        # Check if we need to copy the file
-        if [ ! -f "$backup_wav" ] || [ "$wav_file" -nt "$backup_wav" ]; then
-            log_message "Copying: $track_dir.WAV to $bank_dir" "INFO"
-            cp "$wav_file" "$backup_wav"
+            local wav_file="$SOURCE_DIR/$track_dir/$track_dir.WAV"
+            local backup_wav="$BACKUP_DIR/$bank_dir/$track_dir.WAV"
 
-            if [ $? -eq 0 ]; then
-                ((copied_files++))
-            else
-                log_message "Failed to copy $track_dir.WAV" "ERROR"
-                ((error_files++))
+            if [ -f "$wav_file" ]; then
+                if [ ! -f "$backup_wav" ]; then
+                    printf "${GREEN}copy: %s${NC}\n" "$track_dir.WAV"
+                else
+                    local src_size=$(get_file_size "$wav_file")
+                    local dst_size=$(get_file_size "$backup_wav")
+                    if [ "$src_size" != "$dst_size" ] || \
+                       [ "$(head -c 65536 "$wav_file" | cksum | awk '{print $1}')" != \
+                         "$(head -c 65536 "$backup_wav" | cksum | awk '{print $1}')" ]; then
+                        printf "${YELLOW}replace: %s${NC}\n" "$track_dir.WAV"
+                    else
+                        printf "keep: %s\n" "$track_dir.WAV"
+                    fi
+                fi
+            fi
+        done
+
+        # Prompt for confirmation
+        printf "\nApply these changes? (y/N) "
+        read -r response
+        if [ "${response}" != "y" ] && [ "${response}" != "Y" ]; then
+            log_message "Skipping changes for bank_${bank_num}" "WARNING"
+            continue
+        fi
+
+        # Process approved changes
+        for track_dir in $track_dirs; do
+            local slot_num=${track_dir%_*}
+            slot_num=$(echo "$slot_num" | sed 's/^0*//')
+            local current_bank_num=$(( (10#$slot_num - 1) / 8 + 1 ))
+            [ "$current_bank_num" -ne "$bank_num" ] && continue
+
+            local wav_file="$SOURCE_DIR/$track_dir/$track_dir.WAV"
+            local backup_wav="$BACKUP_DIR/$bank_dir/$track_dir.WAV"
+
+            # Skip if directory is empty or WAV file doesn't exist
+            if [ ! -f "$wav_file" ]; then
                 continue
             fi
-        else
-            log_message "Skipping: $track_dir.WAV (not modified)" "INFO"
-            ((skipped_files++))
+
+            # Create bank directory if needed
+            mkdir -p "$BACKUP_DIR/$bank_dir"
+
+            ((total_files++))
+
+            # Copy the file if it's new or different
+            if [ ! -f "$backup_wav" ] || \
+               [ "$(get_file_size "$wav_file")" != "$(get_file_size "$backup_wav")" ] || \
+               [ "$(head -c 65536 "$wav_file" | cksum | awk '{print $1}')" != \
+                 "$(head -c 65536 "$backup_wav" | cksum | awk '{print $1}')" ]; then
+                log_message "Copying: $track_dir.WAV to $bank_dir" "INFO"
+                cp "$wav_file" "$backup_wav"
+
+                if [ $? -eq 0 ]; then
+                    ((copied_files++))
+                else
+                    log_message "Failed to copy $track_dir.WAV" "ERROR"
+                    ((error_files++))
+                    continue
+                fi
+            else
+                ((skipped_files++))
+            fi
+        done
+
+        # Process deletions if user approved changes
+        if [ $del_count -gt 0 ]; then
+            find "$BACKUP_DIR/$bank_dir" -maxdepth 1 -name "*.WAV" -type f | while read -r backup_file; do
+                local track_name=$(basename "$backup_file" .WAV)
+                if [ ! -f "$SOURCE_DIR/$track_name/$track_name.WAV" ]; then
+                    log_message "Deleting: $track_name.WAV from $bank_dir" "INFO"
+                    rm "$backup_file"
+                fi
+            done
         fi
     done
 
